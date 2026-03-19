@@ -9,11 +9,40 @@ import pandas as pd
 import joblib  # Alternative to pickle for ML models
 import tldextract
 
+import http.client
+from urllib.parse import urlparse, urljoin
+import socket
+import time
+
 app = Flask(__name__)
 CORS(app)  # Enable CORS for Flutter web requests
 
 # Multiple approaches to load the model
 model = None
+
+##start edit
+
+import os
+import requests
+
+# MODEL_PATH = "safelink_malicious_url_rf_model2.pkl"
+# MODEL_URL = "https://drive.google.com/uc?export=download&id=1Bpd7AOeSBxIdSxc3SPPED0NxkjuccF7X"
+
+# def download_model_if_needed():
+#     if not os.path.exists(MODEL_PATH):
+#         print("Model not found locally. Downloading...")
+#         try:
+#             response = requests.get(MODEL_URL, allow_redirects=True)
+#             if response.status_code == 200:
+#                 with open(MODEL_PATH, 'wb') as f:
+#                     f.write(response.content)
+#                 print("Model downloaded successfully.")
+#             else:
+#                 print(f"Failed to download model. Status code: {response.status_code}")
+#         except Exception as e:
+#             print(f"Error downloading model: {str(e)}")
+
+# download_model_if_needed()
 
 # Load top-1m domains
 with open("top-1m.csv", "r") as file:
@@ -29,7 +58,7 @@ def load_model_with_fallbacks():
     
     # Method 1: Try with joblib (recommended for sklearn models)
     try:
-        model = joblib.load('safelink_malicious_url_rf_model.pkl')
+        model = joblib.load('safelink_malicious_url_rf_model2.pkl')
         print("Model loaded successfully with joblib!")
         return True
     except Exception as e:
@@ -38,7 +67,7 @@ def load_model_with_fallbacks():
     # Method 2: Try with pickle using different protocols
     for protocol in [None, 0, 1, 2, 3, 4, 5]:
         try:
-            with open('safelink_malicious_url_rf_model.pkl', 'rb') as f:
+            with open('safelink_malicious_url_rf_model2.pkl', 'rb') as f:
                 if protocol is None:
                     model = pickle.load(f)
                 else:
@@ -52,7 +81,7 @@ def load_model_with_fallbacks():
     
     # Method 3: Try loading with different encoding
     try:
-        with open('safelink_malicious_url_rf_model.pkl', 'rb') as f:
+        with open('safelink_malicious_url_rf_model2.pkl', 'rb') as f:
             model = pickle.load(f, encoding='latin1')
         print("Model loaded successfully with latin1 encoding!")
         return True
@@ -61,7 +90,7 @@ def load_model_with_fallbacks():
     
     # Method 4: Try loading with bytes encoding
     try:
-        with open('safelink_malicious_url_rf_model.pkl', 'rb') as f:
+        with open('safelink_malicious_url_rf_model2.pkl', 'rb') as f:
             model = pickle.load(f, encoding='bytes')
         print("Model loaded successfully with bytes encoding!")
         return True
@@ -139,23 +168,75 @@ def extract_url_features(url):
     features['digit_ratio'] = sum(c.isdigit() for c in url) / len(url) if len(url) > 0 else 0
     features['letter_ratio'] = sum(c.isalpha() for c in url) / len(url) if len(url) > 0 else 0
     
+    features['contains_exe'] = 1 if re.search(r'\.exe(\b|$)', url.lower()) else 0
+
     return features
+
+def unshorten_url(url, max_redirects=20):
+    if not url:
+        return url
+
+    if not url.startswith(('http://', 'https://')):
+        url = 'http://' + url
+
+    redirect_count = 0
+
+    while redirect_count < max_redirects:
+        try:
+            parsed = urlparse(url)
+            conn_cls = http.client.HTTPSConnection if parsed.scheme == 'https' else http.client.HTTPConnection
+            conn = conn_cls(parsed.netloc, timeout=10)
+
+            resource = parsed.path or '/'
+            if parsed.query:
+                resource += '?' + parsed.query
+
+            headers = {
+                'User-Agent': 'Mozilla/5.0',
+                'Accept': '*/*'
+            }
+
+            conn.request('HEAD', resource, headers=headers)
+            response = conn.getresponse()
+
+            if response.status // 100 == 3 and response.getheader('Location'):
+                location = response.getheader('Location')
+                conn.close()
+
+                if not location.startswith(('http://', 'https://')):
+                    location = urljoin(url, location)
+
+                if location == url:
+                    return url
+
+                url = location
+                redirect_count += 1
+                time.sleep(0.2)
+            else:
+                conn.close()
+                return url
+
+        except (socket.gaierror, socket.timeout, Exception):
+            return url
+
+    return url
 
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
-        # Get URL from request
+        # Step 1: Receive raw URL
         data = request.get_json()
-        url = data.get('url', '')
+        original_url = data.get('url', '').strip()
         
-        if not url:
+        if not original_url:
             return jsonify({'error': 'No URL provided'}), 400
-        
-        if model is None:
-            return jsonify({'error': 'Model not loaded'}), 500
-        
-        # Extract features
-        features = extract_url_features(url)
+
+        # Step 2: Unshorten the URL before scanning
+        final_url = unshorten_url(original_url)
+
+        # Step 3: Extract features from the final (unshortened) URL
+        features = extract_url_features(final_url)
+
         
         # Convert to DataFrame (important: maintain same order as training)
         feature_names = [
@@ -165,7 +246,7 @@ def predict():
             'num_hashtag', 'num_dollar', 'num_percent', 'scheme_length', 'netloc_length',
             'path_length', 'query_length', 'fragment_length', 'domain_length',
             'subdomain_count', 'is_ip', 'is_top1m_domain', 'suspicious_words',
-            'entropy', 'digit_ratio', 'letter_ratio'
+            'entropy', 'digit_ratio', 'letter_ratio', 'contains_exe'
             ]
 
         
@@ -188,10 +269,12 @@ def predict():
         #     'malicious_probability': float(probability[1] if len(probability) > 1 else probability[0]),
         #     'features': features
         # }
-        class_labels = {0: 'benign', 1: 'defacement', 2: 'malware', 3: 'phishing'}
+        #class_labels = {0: 'benign', 1: 'defacement', 2: 'malware', 3: 'phishing'}
+        class_labels = {0: 'benign', 1: 'malware', 2: 'phishing'}
         
         result = {
-            'url': url,
+            'original_url': original_url,
+            'unshortened_url': final_url,
             'predicted_class': int(prediction),
             'predicted_label': class_labels.get(int(prediction), 'unknown'),
             'confidence': float(np.max(probabilities)),
@@ -229,4 +312,4 @@ def reload_model():
     return jsonify({'success': success, 'model_loaded': model is not None})
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=True, host='0.0.0.0', port=5000, use_reloader=False)
